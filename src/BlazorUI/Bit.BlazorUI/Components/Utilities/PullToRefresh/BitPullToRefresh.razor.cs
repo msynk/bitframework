@@ -406,20 +406,26 @@ public partial class BitPullToRefresh : BitComponentBase
         {
             CacheJsParameters();
 
-            _dotnetObj = DotNetObjectReference.Create(this);
+            // The setup hands ownership of the reference to the JS side, so it is only worth creating when
+            // the call can actually reach it: on an invalid runtime InvokeVoid skips the call and returns
+            // without throwing, which would leave a reference nothing on either side owns.
+            if (_js.IsRuntimeInvalid() is false)
+            {
+                _dotnetObj = DotNetObjectReference.Create(this);
 
-            try
-            {
-                await _js.BitPullToRefreshSetup(UniqueId, RootElement, _loadingRef, ScrollerElement, ScrollerSelector, _Trigger, _Factor, _Margin, _Threshold, _MaxPull, IsEnabled, _dotnetObj);
-            }
-            catch
-            {
-                // The setup didn't complete, so JS never registered this id and never took ownership of the
-                // reference - and the JS dispose silently no-ops for an unknown id, so DisposeAsync can't
-                // release it either. Release it here, then rethrow so the original failure still surfaces.
-                _dotnetObj.Dispose();
-                _dotnetObj = null;
-                throw;
+                try
+                {
+                    await _js.BitPullToRefreshSetup(UniqueId, RootElement, _loadingRef, ScrollerElement, ScrollerSelector, _Trigger, _Factor, _Margin, _Threshold, _MaxPull, IsEnabled, _dotnetObj);
+                }
+                catch
+                {
+                    // The setup didn't complete, so JS never registered this id and never took ownership of
+                    // the reference - and the JS dispose silently no-ops for an unknown id, so DisposeAsync
+                    // can't release it either. Release it here, then rethrow so the failure still surfaces.
+                    _dotnetObj.Dispose();
+                    _dotnetObj = null;
+                    throw;
+                }
             }
         }
 
@@ -609,7 +615,19 @@ public partial class BitPullToRefresh : BitComponentBase
         // the .NET reference in its dispose(). Disposing it here too would double-dispose the same object.
         try
         {
-            await _js.BitPullToRefreshDispose(UniqueId);
+            if (_js.IsRuntimeInvalid())
+            {
+                // The runtime can no longer service interop at all (a circuit that never initialized or is
+                // permanently gone, a detached WebView), so InvokeVoid skips the call and returns without
+                // throwing: the JS dispose that owns _dotnetObj never runs, and neither catch below is
+                // reached. Release the managed reference here instead of leaking it.
+                _dotnetObj?.Dispose();
+                _dotnetObj = null;
+            }
+            else
+            {
+                await _js.BitPullToRefreshDispose(UniqueId);
+            }
         }
         catch (JSDisconnectedException)
         {

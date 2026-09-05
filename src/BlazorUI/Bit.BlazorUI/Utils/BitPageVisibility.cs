@@ -72,18 +72,27 @@ public class BitPageVisibility(IJSRuntime js) : IAsyncDisposable
         if (_isInitialized)
         {
             // Awaits the JS teardown so the global visibilitychange/blur/focus listeners are actually
-            // cleared and any failure surfaces instead of being swallowed by a fire-and-forget call. The
-            // JS-side init guard is reset too, so a future instance can re-init.
+            // cleared before this instance goes away, rather than left behind by a fire-and-forget call.
+            // The JS-side init guard is reset too, so a future instance can re-init.
             try
             {
                 await js.InvokeVoid("BitBlazorUI.PageVisibility.dispose");
             }
-            catch (JSDisconnectedException) { } // circuit already gone; nothing to clean up on the JS side
+            catch (Exception ex) when (ex is JSDisconnectedException or JSException or ObjectDisposedException or OperationCanceledException)
+            {
+                // Disposal must never throw: this runs from the DI container's scope disposal, where an
+                // exception escaping here would abort the disposal of everything else in the scope. Every
+                // exception caught means the same thing - the JS listeners can no longer be reached: the
+                // circuit is already gone (JSDisconnectedException), the teardown itself failed in the
+                // browser (JSException), the runtime has been torn down (ObjectDisposedException), or the
+                // interop call timed out (OperationCanceledException). The local cleanup in the finally
+                // below is then all that is left to do.
+            }
             finally
             {
                 // Local cleanup runs in finally so it always executes even if the JS teardown throws
-                // something other than JSDisconnectedException (e.g. JSException, OperationCanceledException,
-                // InvalidOperationException), guaranteeing deterministic disposal.
+                // something outside the caught set above (e.g. InvalidOperationException), guaranteeing
+                // deterministic disposal.
                 _isInitialized = false;
                 _dotnetObj?.Dispose();
             }
