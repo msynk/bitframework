@@ -1410,6 +1410,37 @@ public class BitDataGridTests : BunitTestContext
     }
 
     [TestMethod]
+    [DataRow(BitSide.Bottom, 0, 1)]
+    [DataRow(BitSide.Top, 1, 0)]
+    [DataRow(BitSide.TopAndBottom, 1, 1)]
+    // A side the grid has no physical place for still leaves the pager under the grid,
+    // rather than dropping it from a pageable grid altogether.
+    [DataRow(BitSide.Start, 0, 1)]
+    [DataRow(BitSide.End, 0, 1)]
+    [DataRow(BitSide.Left, 0, 1)]
+    [DataRow(BitSide.Right, 0, 1)]
+    [DataRow(BitSide.StartAndEnd, 0, 1)]
+    public void PagerPositionFallsBackToUnderTheGrid(BitSide position, int expectedAbove, int expectedBelow)
+    {
+        var component = RenderGrid(configure: parameters =>
+        {
+            parameters.Add(p => p.Pageable, true);
+            parameters.Add(p => p.PageSize, 2);
+            parameters.Add(p => p.PagerPosition, position);
+        });
+
+        // Both matches in document order, so the viewport's index says which side each pager is on.
+        var parts = component.FindAll(".bit-dtg-pager, .bit-dtg-viewport")
+            .Select(e => e.ClassList.Contains("bit-dtg-pager") ? "pager" : "viewport")
+            .ToList();
+        var viewportIndex = parts.IndexOf("viewport");
+
+        Assert.AreEqual(expectedAbove + expectedBelow + 1, parts.Count);
+        Assert.AreEqual(expectedAbove, viewportIndex);
+        Assert.AreEqual(expectedBelow, parts.Count - viewportIndex - 1);
+    }
+
+    [TestMethod]
     public void ColumnsParameterAliasesChildContent()
     {
         var component = RenderComponent<BitDataGrid<TestRow>>(parameters =>

@@ -16,7 +16,7 @@
         @RenderTitle(sub, "bc-subtitle")
     }
 
-    @if (_scene.Legend is { Position: BitSide.Top })
+    @if (_scene.Legend is { Position: not (BitSide.Bottom or BitSide.Left or BitSide.Right) })
     {
         @RenderLegend(_scene.Legend)
     }

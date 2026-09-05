@@ -434,7 +434,7 @@
         </div>
     </div>
 
-    @if (PagingActive && (PagerPosition is BitSide.Bottom or BitSide.TopAndBottom))
+    @if (PagingActive && (PagerPosition is not BitSide.Top))
     {
         @RenderPager
     }
