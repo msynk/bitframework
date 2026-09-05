@@ -1,3 +1,6 @@
+using System.Globalization;
+using System.Runtime.CompilerServices;
+
 namespace Bit.BlazorUI;
 
 /// <summary>
@@ -8,15 +11,29 @@ namespace Bit.BlazorUI;
 public partial class BitAccordionList<TItem> : BitComponentBase where TItem : class
 {
     private int _optionKeySeed;
+    private bool _isToggling;
+    private bool _oldMultiple;
+    private bool _pendingBoundKeysPush;
     private List<TItem> _items = [];
-    private IEnumerable<TItem> _oldItems = default!;
+    private List<TItem>? _oldItems;
     private string? _internalExpandedKey;
     private List<string> _internalExpandedKeys = [];
-    private readonly HashSet<string> _expandedKeys = [];
+    private BitAccordionListClassStyles? _oldClasses;
+    private BitAccordionListClassStyles? _oldStyles;
+    private readonly HashSet<string> _expandedKeys = new(StringComparer.Ordinal);
+    private readonly Dictionary<TItem, string> _fallbackKeys = new(ReferenceComparer.Instance);
+    private readonly Dictionary<TItem, _BitAccordionListItem<TItem>> _itemRefs = new(ReferenceComparer.Instance);
     internal BitAccordionClassStyles? _itemClasses;
     internal BitAccordionClassStyles? _itemStyles;
 
 
+
+    /// <summary>
+    /// The custom template to render beside the header of each item, outside of the toggle button and of the
+    /// heading it sits in, so that it can hold its own interactive elements (a menu, a delete button, a switch).
+    /// Used when an item does not provide its own actions.
+    /// </summary>
+    [Parameter] public RenderFragment<TItem>? ActionsTemplate { get; set; }
 
     /// <summary>
     /// The color kind of the background of all the accordion items.
@@ -37,6 +54,23 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
     /// Custom CSS classes for different parts of the AccordionList.
     /// </summary>
     [Parameter] public BitAccordionListClassStyles? Classes { get; set; }
+
+    /// <summary>
+    /// Allows the expanded item to be collapsed again from its own header.
+    /// <br />
+    /// The default value is <strong>true</strong>.
+    /// </summary>
+    /// <remarks>
+    /// Setting it to false keeps one item open at all times: the header of the last expanded item reports
+    /// itself as <c>aria-disabled</c>, the way the WAI-ARIA authoring practices ask a header that cannot
+    /// collapse its panel to, and no longer answers the pointer or the keyboard.
+    /// <br />
+    /// It is the header that is closed off, not the list itself: the <see cref="Collapse(string)"/>,
+    /// <see cref="Toggle(string)"/> and <see cref="CollapseAll"/> methods still drive the AccordionList, and
+    /// nothing is expanded on its behalf, so a list that starts with everything collapsed stays that way until
+    /// something is opened.
+    /// </remarks>
+    [Parameter] public bool Collapsible { get; set; } = true;
 
     /// <summary>
     /// The custom template to render the body (content) of each item. Used when an item does not provide its own body.
@@ -64,6 +98,22 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
     [Parameter, TwoWayBound] public IEnumerable<string>? ExpandedKeys { get; set; }
 
     /// <summary>
+    /// Gets or sets the icon to show in place of the expander icon of all items while they are expanded, using
+    /// custom CSS classes for external icon libraries.
+    /// Takes precedence over <see cref="ExpandedExpanderIconName"/> when both are set.
+    /// Setting either of them also turns the rotation of the expander icon off, since a swapped icon already
+    /// reports the state on its own. Can be overridden per item.
+    /// </summary>
+    [Parameter] public BitIconInfo? ExpandedExpanderIcon { get; set; }
+
+    /// <summary>
+    /// Gets or sets the name of the icon, from the built-in Fluent UI icons, to show in place of the expander
+    /// icon of all items while they are expanded.
+    /// Setting it also turns the rotation of the expander icon off. Can be overridden per item.
+    /// </summary>
+    [Parameter] public string? ExpandedExpanderIconName { get; set; }
+
+    /// <summary>
     /// Gets or sets the icon to display as the expander of all items using custom CSS classes for external icon libraries.
     /// Takes precedence over <see cref="ExpanderIconName"/> when both are set.
     /// Can be overridden per item.
@@ -77,6 +127,30 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
     [Parameter] public string? ExpanderIconName { get; set; }
 
     /// <summary>
+    /// Gets or sets the side of the header the expander icon of all the items sits on.
+    /// <br />
+    /// The default value is <see cref="BitIconPosition.End"/>.
+    /// </summary>
+    [Parameter] public BitIconPosition? ExpanderIconPosition { get; set; }
+
+    /// <summary>
+    /// The custom template to render in place of the expander icon of each item, leaving the rest of the header
+    /// as it is. Used when an item does not provide its own expander template.
+    /// </summary>
+    [Parameter] public RenderFragment<TItem>? ExpanderTemplate { get; set; }
+
+    /// <summary>
+    /// Opens the panel of every item while the page is being printed, so that a collapsed section is not left
+    /// out of the paper as a bare header.
+    /// </summary>
+    /// <remarks>
+    /// Content that is not in the DOM at all cannot be printed by any of this: a <see cref="LazyContent"/>
+    /// panel that has never been opened, and every collapsed panel of a list that uses
+    /// <see cref="UnmountOnCollapse"/>, are still printed as a bare header.
+    /// </remarks>
+    [Parameter] public bool ExpandOnPrint { get; set; }
+
+    /// <summary>
     /// The space (gap) in pixels between the accordion items.
     /// </summary>
     [Parameter, ResetStyleBuilder] public int? Gap { get; set; }
@@ -87,9 +161,34 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
     [Parameter] public RenderFragment<TItem>? HeaderTemplate { get; set; }
 
     /// <summary>
+    /// Gets or sets the heading level (aria-level) reported for the header of every item, so that the list
+    /// takes its right place in the heading outline of the page.
+    /// <br />
+    /// The default value is <strong>3</strong>, and the value is clamped to the 1..6 range.
+    /// </summary>
+    [Parameter] public int? HeadingLevel { get; set; }
+
+    /// <summary>
+    /// Removes the expander icon from the header of all the items. Can be overridden per item.
+    /// </summary>
+    [Parameter] public bool HideExpanderIcon { get; set; }
+
+    /// <summary>
     /// The collection of items to render in the AccordionList.
     /// </summary>
     [Parameter] public IEnumerable<TItem> Items { get; set; } = [];
+
+    /// <summary>
+    /// Delays the first render of the content of each item until it is expanded for the first time. The content
+    /// stays in the DOM afterwards, so the state it holds survives a collapse.
+    /// </summary>
+    [Parameter] public bool LazyContent { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum height of the content of every item (any CSS length), beyond which the content
+    /// scrolls inside the item instead of growing it.
+    /// </summary>
+    [Parameter] public string? MaxHeight { get; set; }
 
     /// <summary>
     /// Enables the multiple-expand mode in which more than one item can be expanded at the same time.
@@ -97,9 +196,38 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
     [Parameter, ResetClassBuilder] public bool Multiple { get; set; }
 
     /// <summary>
+    /// Moves the focus between the headers of the items with the ArrowUp, ArrowDown, Home and End keys, which
+    /// the WAI-ARIA authoring practices offer as an addition to the Tab key rather than in place of it.
+    /// <br />
+    /// The default value is <strong>true</strong>.
+    /// </summary>
+    /// <remarks>
+    /// Only the headers answer these keys: the same keys pressed inside the panel of an item belong to whatever
+    /// the panel holds and are left alone. The navigation wraps around at both ends of the list and skips the
+    /// items that are disabled.
+    /// </remarks>
+    [Parameter] public bool Navigable { get; set; } = true;
+
+    /// <summary>
     /// Removes the default border of all the accordion items and gives a background color to their body.
     /// </summary>
     [Parameter] public bool NoBorder { get; set; }
+
+    /// <summary>
+    /// Removes the <c>region</c> role from the panel of every item, leaving it a plain container.
+    /// </summary>
+    /// <remarks>
+    /// The role names the panel as a landmark, which helps a screen reader user find their way back to the
+    /// content of a panel that holds headings or another accordion. The WAI-ARIA authoring practices ask for it
+    /// to be dropped where it would flood the page with landmarks instead - more than about six panels that can
+    /// all be open at the same time - which is what this is for.
+    /// </remarks>
+    [Parameter] public bool NoContentRegion { get; set; }
+
+    /// <summary>
+    /// Keeps the expander icon of every item still instead of turning it over when the item is expanded.
+    /// </summary>
+    [Parameter] public bool NoExpanderRotation { get; set; }
 
     /// <summary>
     /// The callback that is called when an item is collapsed.
@@ -122,6 +250,22 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
     [Parameter] public EventCallback<TItem> OnToggle { get; set; }
 
     /// <summary>
+    /// Callback invoked before an item expands or collapses, letting the change be cancelled.
+    /// </summary>
+    /// <remarks>
+    /// Set <c>Cancel</c> on the provided <see cref="BitAccordionListToggleArgs{TItem}"/> to leave the item as it
+    /// is, and read its <c>Item</c>, <c>Key</c>, <c>IsExpanding</c> and <c>Reason</c> to tell an expansion from a
+    /// collapse and a click on a header from an <see cref="Expand(string)"/>, <see cref="Collapse(string)"/>,
+    /// <see cref="Toggle(string)"/>, <see cref="ExpandAll"/> or <see cref="CollapseAll"/> call. Since the callback
+    /// is awaited, it can also run asynchronous work first, and nothing else toggles the list while it is running.
+    /// <br />
+    /// The implicit collapse of the previously expanded item in single-expand mode is part of the expansion that
+    /// caused it and is not offered here; it is still reported through <see cref="OnCollapse"/> and
+    /// <see cref="OnToggle"/>.
+    /// </remarks>
+    [Parameter] public EventCallback<BitAccordionListToggleArgs<TItem>> OnToggling { get; set; }
+
+    /// <summary>
     /// Alias of the ChildContent.
     /// </summary>
     [Parameter] public RenderFragment? Options { get; set; }
@@ -132,54 +276,175 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
     [Parameter] public BitAccordionListNameSelectors<TItem>? NameSelectors { get; set; }
 
     /// <summary>
+    /// Leaves every item where it is: the headers keep their colors and their place in the tab order, but they
+    /// no longer answer the pointer or the keyboard. Can be overridden per item.
+    /// </summary>
+    /// <remarks>
+    /// This is the list whose panels have to stay as they are rather than the one that is turned off, so the
+    /// headers report themselves as <c>aria-disabled</c> without being greyed out the way
+    /// <see cref="BitComponentBase.IsEnabled"/> greys them. <see cref="OnItemClick"/> still reports the click,
+    /// and the public methods still drive the list.
+    /// </remarks>
+    [Parameter] public bool ReadOnly { get; set; }
+
+    /// <summary>
+    /// Gets or sets the size of all the accordion items, which drives the padding of the headers and of the
+    /// contents and the size of the titles.
+    /// <br />
+    /// The default value is <see cref="BitSize.Medium"/>.
+    /// </summary>
+    [Parameter] public BitSize? Size { get; set; }
+
+    /// <summary>
     /// Custom CSS styles for different parts of the AccordionList.
     /// </summary>
     [Parameter] public BitAccordionListClassStyles? Styles { get; set; }
 
+    /// <summary>
+    /// The custom template to render in place of the title of each item, leaving the rest of the header as it is.
+    /// Used when an item does not provide its own title template.
+    /// </summary>
+    [Parameter] public RenderFragment<TItem>? TitleTemplate { get; set; }
+
+    /// <summary>
+    /// Gets or sets the duration of the expand/collapse transition of every item in milliseconds, overriding the
+    /// duration the theme provides. A reduced-motion preference still collapses it, unless the ForceAnimation
+    /// parameter opts out of that.
+    /// </summary>
+    [Parameter] public int? TransitionDuration { get; set; }
+
+    /// <summary>
+    /// Removes the content of an item from the DOM while it is collapsed, so that nothing it holds keeps running
+    /// behind a closed header.
+    /// </summary>
+    [Parameter] public bool UnmountOnCollapse { get; set; }
+
 
 
     /// <summary>
-    /// Expands all the items (only effective in multiple-expand mode).
+    /// Expands all the items (only effective in multiple-expand mode). Disabled items are left as they are,
+    /// since their headers could not close again what would be opened for them.
     /// </summary>
     public async Task ExpandAll()
     {
         if (Multiple is false) return;
 
-        foreach (var item in _items)
+        var changed = false;
+
+        foreach (var item in _items.ToArray())
         {
+            if (GetIsEnabled(item) is false) continue;
+
             var key = GetItemKey(item);
             if (key.HasNoValue() || _expandedKeys.Contains(key!)) continue;
 
-            _expandedKeys.Add(key!);
-            SetIsExpanded(item, true);
-            await OnExpand.InvokeAsync(item);
-            await OnToggle.InvokeAsync(item);
+            changed |= await ApplyToggle(item, key!, true, BitAccordionToggleReason.Method);
         }
 
+        if (changed is false) return;
+
         await UpdateBoundKeys();
-        RefreshOptions();
-        StateHasChanged();
+        await RefreshAndRender();
     }
 
     /// <summary>
-    /// Collapses all the expanded items.
+    /// Collapses all the expanded items, the disabled ones included.
     /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="ExpandAll"/>, which cannot open what is turned off, this one closes every panel: a
+    /// disabled item whose panel was opened by a default value would otherwise be left open with no way of
+    /// closing it, since its own header answers nothing.
+    /// </remarks>
     public async Task CollapseAll()
     {
-        foreach (var item in _items)
+        var changed = false;
+
+        foreach (var item in _items.ToArray())
         {
             var key = GetItemKey(item);
             if (key.HasNoValue() || _expandedKeys.Contains(key!) is false) continue;
 
-            _expandedKeys.Remove(key!);
-            SetIsExpanded(item, false);
-            await OnCollapse.InvokeAsync(item);
-            await OnToggle.InvokeAsync(item);
+            changed |= await ApplyToggle(item, key!, false, BitAccordionToggleReason.Method);
         }
 
+        // Keys that no longer map to an item of the list are dropped along with the rest, so a collapsed list
+        // does not keep reporting them through the two-way bound ExpandedKey(s).
+        var orphans = _expandedKeys.Where(k => FindItem(k) is null).ToArray();
+        if (orphans.Length > 0)
+        {
+            foreach (var orphan in orphans) _expandedKeys.Remove(orphan);
+            changed = true;
+        }
+
+        if (changed is false) return;
+
         await UpdateBoundKeys();
-        RefreshOptions();
-        StateHasChanged();
+        await RefreshAndRender();
+    }
+
+    /// <summary>
+    /// Expands the item with the provided key. Does nothing if it is already expanded or if no item carries
+    /// that key. In single-expand mode the currently expanded item is collapsed along the way.
+    /// </summary>
+    /// <remarks>
+    /// A call of its own is not turned away by <see cref="BitComponentBase.IsEnabled"/>, by
+    /// <see cref="ReadOnly"/> or by <see cref="Collapsible"/>: what those close off is the way in from the
+    /// header, not the one the app itself uses.
+    /// </remarks>
+    public Task Expand(string key) => SetExpandedByKey(key, true);
+
+    /// <summary>
+    /// Collapses the item with the provided key. Does nothing if it is already collapsed or if no item carries
+    /// that key.
+    /// </summary>
+    /// <remarks>
+    /// Not turned away by <see cref="BitComponentBase.IsEnabled"/>, <see cref="ReadOnly"/> or
+    /// <see cref="Collapsible"/>; see <see cref="Expand(string)"/>.
+    /// </remarks>
+    public Task Collapse(string key) => SetExpandedByKey(key, false);
+
+    /// <summary>
+    /// Expands the item with the provided key if it is collapsed and collapses it if it is expanded.
+    /// </summary>
+    /// <remarks>
+    /// Not turned away by <see cref="BitComponentBase.IsEnabled"/>, <see cref="ReadOnly"/> or
+    /// <see cref="Collapsible"/>; see <see cref="Expand(string)"/>.
+    /// </remarks>
+    public Task Toggle(string key)
+    {
+        return key.HasNoValue() ? Task.CompletedTask : SetExpandedByKey(key, _expandedKeys.Contains(key) is false);
+    }
+
+    /// <summary>
+    /// Reports whether the item with the provided key is currently expanded.
+    /// </summary>
+    public bool IsExpanded(string? key) => key.HasValue() && _expandedKeys.Contains(key!);
+
+    /// <summary>
+    /// Returns the keys of the currently expanded items, in the order of the items of the list.
+    /// </summary>
+    public IReadOnlyList<string> GetExpandedKeys() => GetOrderedExpandedKeys();
+
+    /// <summary>
+    /// Gives the focus to the header of the item with the provided key.
+    /// </summary>
+    public async Task FocusItem(string key)
+    {
+        var item = FindItem(key);
+        if (item is null) return;
+
+        await InvokeAsync(() => FocusItemCore(item));
+    }
+
+    /// <summary>
+    /// Gives the focus to the header of the first item of the list that can take it.
+    /// </summary>
+    public async Task FocusAsync()
+    {
+        var item = _items.FirstOrDefault(GetIsEnabled);
+        if (item is null) return;
+
+        await InvokeAsync(() => FocusItemCore(item));
     }
 
 
@@ -190,10 +455,10 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         {
             // Use a monotonic seed so keys remain unique even after removals, and guard
             // against colliding with any existing explicit keys.
-            var key = (_optionKeySeed++).ToString();
+            var key = _optionKeySeed++.ToString(CultureInfo.InvariantCulture);
             while (_items.Any(i => GetItemKey(i) == key))
             {
-                key = (_optionKeySeed++).ToString();
+                key = _optionKeySeed++.ToString(CultureInfo.InvariantCulture);
             }
             option.Key = key;
         }
@@ -207,6 +472,11 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
             _expandedKeys.Add(option.Key!);
             _internalExpandedKeys = GetOrderedExpandedKeys();
             _internalExpandedKey = _internalExpandedKeys.FirstOrDefault();
+
+            // The bound value is pushed as well, so a page that binds ExpandedKey(s) is told about the option
+            // that opened itself on registration rather than being left with a stale value. It is deferred to
+            // the end of the render, since the registration runs in the middle of one.
+            _pendingBoundKeysPush = true;
         }
 
         StateHasChanged();
@@ -247,7 +517,11 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
 
     internal async Task UnregisterOption(BitAccordionListOption option)
     {
-        _items.Remove((option as TItem)!);
+        var item = (option as TItem)!;
+
+        _items.Remove(item);
+        _itemRefs.Remove(item);
+        _fallbackKeys.Remove(item);
 
         var wasExpanded = false;
         if (option.Key.HasValue())
@@ -263,6 +537,16 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         }
 
         StateHasChanged();
+    }
+
+    internal void RegisterItem(TItem item, _BitAccordionListItem<TItem> itemRef)
+    {
+        _itemRefs[item] = itemRef;
+    }
+
+    internal void UnregisterItem(TItem item)
+    {
+        _itemRefs.Remove(item);
     }
 
 
@@ -283,33 +567,49 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         StyleBuilder.Register(() => Gap.HasValue ? $"gap:{Gap}px" : string.Empty);
     }
 
-    protected override async Task OnInitializedAsync()
-    {
-        _items = (ChildContent is null && Options is null && Items is not null) ? [.. Items] : [];
-
-        if (ChildContent is null && Options is null)
-        {
-            AssignItemKeys();
-            InitializeExpandedKeys();
-        }
-
-        await base.OnInitializedAsync();
-    }
-
     protected override async Task OnParametersSetAsync()
     {
         BuildItemClassStyles();
 
         if (ChildContent is null && Options is null && Items is not null)
         {
-            if (_oldItems is null || (ReferenceEquals(Items, _oldItems) is false && Items.SequenceEqual(_oldItems) is false))
+            // The snapshot is a copy rather than the collection itself, so a page that keeps mutating the very
+            // list it handed over - adding an item to it, removing one - is still noticed here.
+            if (_oldItems is null || Items.SequenceEqual(_oldItems) is false)
             {
-                _oldItems = Items;
+                var isFirstPass = _oldItems is null;
+
+                _oldItems = [.. Items];
                 _items = [.. Items];
+
                 AssignItemKeys();
-                InitializeExpandedKeys();
+
+                // Only the very first pass falls back to the default values: a later change of the collection
+                // must not throw away the state the reader has built up by opening and closing the panels.
+                InitializeExpandedKeys(preserveCurrent: isFirstPass is false);
             }
         }
+
+        // Leaving the multiple-expand mode with more than one panel open would otherwise keep them all open
+        // until the next click, which is the one state a single-expand list is there to rule out.
+        if (_oldMultiple && Multiple is false && _expandedKeys.Count > 1)
+        {
+            var kept = GetOrderedExpandedKeys().FirstOrDefault();
+
+            _expandedKeys.Clear();
+            if (kept.HasValue()) _expandedKeys.Add(kept!);
+
+            SyncItemsExpandedState();
+
+            _internalExpandedKeys = GetOrderedExpandedKeys();
+            _internalExpandedKey = _internalExpandedKeys.FirstOrDefault();
+
+            // The push is deferred to the end of the render, since a parameter set is no place to call back
+            // into the page that is setting them.
+            _pendingBoundKeysPush = true;
+        }
+
+        _oldMultiple = Multiple;
 
         // React to external (controlled) changes of the bound keys.
         if (Multiple)
@@ -334,16 +634,39 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         await base.OnParametersSetAsync();
     }
 
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_pendingBoundKeysPush)
+        {
+            _pendingBoundKeysPush = false;
+
+            await PushBoundKeys();
+        }
+
+        await base.OnAfterRenderAsync(firstRender);
+    }
+
 
 
     private void AssignItemKeys()
     {
-        // Collect the explicit keys first so the auto-generated keys never collide with them.
-        var usedKeys = new HashSet<string>();
+        // Collect the explicit keys first so the generated keys never collide with them.
+        var usedKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var item in _items)
         {
-            var key = GetItemKey(item);
+            var key = GetDeclaredKey(item);
             if (key.HasValue()) usedKeys.Add(key!);
+        }
+
+        var present = new HashSet<TItem>(_items, ReferenceComparer.Instance);
+
+        foreach (var item in _fallbackKeys.Keys.ToArray())
+        {
+            // A key handed out earlier is kept where the item is still in the list and the key is still free,
+            // so an item does not lose its expanded state only because the collection around it changed.
+            if (present.Contains(item) && usedKeys.Add(_fallbackKeys[item])) continue;
+
+            _fallbackKeys.Remove(item);
         }
 
         for (int i = 0; i < _items.Count; i++)
@@ -354,10 +677,10 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
             // Start from the loop index and increment until a non-colliding key is found so the
             // result stays deterministic across renders while remaining unique.
             var suffix = i;
-            var candidate = suffix.ToString();
+            var candidate = suffix.ToString(CultureInfo.InvariantCulture);
             while (usedKeys.Contains(candidate))
             {
-                candidate = (++suffix).ToString();
+                candidate = (++suffix).ToString(CultureInfo.InvariantCulture);
             }
 
             SetItemKey(item, candidate);
@@ -365,16 +688,26 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         }
     }
 
-    private void InitializeExpandedKeys()
+    private void InitializeExpandedKeys(bool preserveCurrent = false)
     {
+        // Read before the set is cleared: the keys of the items that were expanded and are still in the list.
+        var surviving = preserveCurrent ? GetSurvivingExpandedKeys() : null;
+        var selfExpanded = GetSelfExpandedKeys();
+
         _expandedKeys.Clear();
 
-        // Controlled values take precedence over default values.
+        // Controlled values take precedence over what was there before, which takes precedence over the
+        // default values, which take precedence over the items' own IsExpanded.
         if (Multiple)
         {
             if (ExpandedKeysHasBeenSet && ExpandedKeys is not null)
             {
                 AddExpandedKeys(ExpandedKeys);
+            }
+            else if (surviving is not null)
+            {
+                AddExpandedKeys(surviving);
+                AddExpandedKeys(selfExpanded);
             }
             else if (DefaultExpandedKeys is not null)
             {
@@ -382,20 +715,20 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
             }
             else
             {
-                foreach (var item in _items.Where(GetIsExpanded))
-                {
-                    var key = GetItemKey(item);
-                    if (key.HasValue()) _expandedKeys.Add(key!);
-                }
+                AddExpandedKeys(selfExpanded);
             }
         }
         else
         {
-            string? key = null;
+            string? key;
 
             if (ExpandedKeyHasBeenSet)
             {
                 key = ExpandedKey;
+            }
+            else if (surviving is not null)
+            {
+                key = surviving.FirstOrDefault() ?? selfExpanded.FirstOrDefault();
             }
             else if (DefaultExpandedKey.HasValue())
             {
@@ -403,7 +736,7 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
             }
             else
             {
-                key = _items.Where(GetIsExpanded).Select(GetItemKey).FirstOrDefault(k => k.HasValue());
+                key = selfExpanded.FirstOrDefault();
             }
 
             if (key.HasValue()) _expandedKeys.Add(key!);
@@ -413,6 +746,16 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
 
         _internalExpandedKeys = GetOrderedExpandedKeys();
         _internalExpandedKey = _internalExpandedKeys.FirstOrDefault();
+    }
+
+    private List<string> GetSurvivingExpandedKeys()
+    {
+        return [.. _items.Select(GetItemKey).Where(k => k.HasValue() && _expandedKeys.Contains(k!)).Select(k => k!)];
+    }
+
+    private List<string> GetSelfExpandedKeys()
+    {
+        return [.. _items.Where(GetIsExpanded).Select(GetItemKey).Where(k => k.HasValue()).Select(k => k!)];
     }
 
     private void AddExpandedKeys(IEnumerable<string> keys)
@@ -439,7 +782,7 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
     private List<string> GetOrderedExpandedKeys()
     {
         var ordered = new List<string>(_expandedKeys.Count);
-        var seen = new HashSet<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var item in _items)
         {
@@ -480,40 +823,127 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
     {
         if (IsEnabled is false || GetIsEnabled(item) is false) return;
 
-        _ = OnItemClick.InvokeAsync(item);
+        await OnItemClick.InvokeAsync(item);
 
-        InvokeItemClick(item);
+        await InvokeItemClick(item);
+
+        // A read-only item still reports the click - the page can want to say why the panel is staying where
+        // it is - it just does not act on it.
+        if (GetItemIsReadOnly(item)) return;
 
         var key = GetItemKey(item);
         if (key.HasNoValue()) return;
 
-        var isExpanded = _expandedKeys.Contains(key!);
+        var expand = _expandedKeys.Contains(key!) is false;
 
-        await ToggleItem(item, key!, isExpanded is false);
+        await ToggleItem(item, key!, expand, BitAccordionToggleReason.Click);
     }
 
-    private async Task ToggleItem(TItem item, string key, bool expand)
+    internal async Task HandleOnItemKeyDown(KeyboardEventArgs e, TItem item)
     {
+        if (Navigable is false || IsEnabled is false) return;
+
+        if (e.Key is not ("ArrowDown" or "ArrowUp" or "Home" or "End")) return;
+
+        // A disabled header is out of the tab order, so the navigation walks past it rather than parking the
+        // focus on something that cannot be reached by the Tab key either.
+        var focusables = _items.Where(GetIsEnabled).ToList();
+        if (focusables.Count == 0) return;
+
+        var index = focusables.FindIndex(i => ReferenceEquals(i, item));
+        if (index < 0) return;
+
+        var next = e.Key switch
+        {
+            "ArrowDown" => index + 1,
+            "ArrowUp" => index - 1,
+            "Home" => 0,
+            _ => focusables.Count - 1
+        };
+
+        // The navigation wraps around at both ends of the list.
+        if (next < 0) next = focusables.Count - 1;
+        else if (next >= focusables.Count) next = 0;
+
+        await FocusItemCore(focusables[next]);
+    }
+
+    private async Task SetExpandedByKey(string key, bool expand)
+    {
+        if (key.HasNoValue()) return;
+
+        var item = FindItem(key);
+        if (item is null) return;
+
+        if (_expandedKeys.Contains(key) == expand) return;
+
+        await ToggleItem(item, key, expand, BitAccordionToggleReason.Method);
+    }
+
+    private async Task ToggleItem(TItem item, string key, bool expand, BitAccordionToggleReason reason)
+    {
+        // Read before the expansion is applied, since applying it adds the new key to the set. A cancelled
+        // expansion therefore leaves the previously expanded item exactly where it was.
+        var others = (expand && Multiple is false) ? _expandedKeys.Where(k => k != key).ToArray() : [];
+
+        if (await ApplyToggle(item, key, expand, reason) is false) return;
+
+        // Collapse the item(s) that were expanded before, in single-expand mode.
+        foreach (var otherKey in others)
+        {
+            if (_expandedKeys.Remove(otherKey) is false) continue;
+
+            var otherItem = FindItem(otherKey);
+            if (otherItem is null) continue;
+
+            SetIsExpanded(otherItem, false);
+            await OnCollapse.InvokeAsync(otherItem);
+            await OnToggle.InvokeAsync(otherItem);
+        }
+
+        await UpdateBoundKeys();
+
+        // A toggle can affect other items too (single-expand mode collapses the previously expanded
+        // item), and the click handler runs on the clicked item's renderer, so both the registered
+        // options and the accordion list itself need an explicit re-render.
+        await RefreshAndRender();
+    }
+
+    // Runs the cancellable OnToggling callback and, when it is not refused, moves the single item between the
+    // expanded and the collapsed state. The bound keys and the re-render are left to the caller, so that a
+    // batch of items - ExpandAll, CollapseAll - reports itself once rather than once per item.
+    private async Task<bool> ApplyToggle(TItem item, string key, bool expand, BitAccordionToggleReason reason)
+    {
+        if (_expandedKeys.Contains(key) == expand) return false;
+
+        if (OnToggling.HasDelegate)
+        {
+            // The callback is awaited, so a second click - or a Toggle call while a confirmation prompt is
+            // still open - would otherwise start a change of its own alongside the first one.
+            if (_isToggling) return false;
+
+            _isToggling = true;
+
+            try
+            {
+                var args = new BitAccordionListToggleArgs<TItem>(item, key, expand, reason);
+
+                await OnToggling.InvokeAsync(args);
+
+                if (args.Cancel) return false;
+
+                // The state can have moved on while the callback was awaited - the page can have driven the
+                // bound keys itself, or disposed the list altogether.
+                if (IsDisposed || _expandedKeys.Contains(key) == expand) return false;
+            }
+            finally
+            {
+                _isToggling = false;
+            }
+        }
+
         if (expand)
         {
-            if (Multiple is false)
-            {
-                // Collapse the currently expanded item(s) in single-expand mode.
-                foreach (var otherKey in _expandedKeys.ToArray())
-                {
-                    if (otherKey == key) continue;
-
-                    _expandedKeys.Remove(otherKey);
-                    var otherItem = _items.FirstOrDefault(i => GetItemKey(i) == otherKey);
-                    if (otherItem is not null)
-                    {
-                        SetIsExpanded(otherItem, false);
-                        await OnCollapse.InvokeAsync(otherItem);
-                        await OnToggle.InvokeAsync(otherItem);
-                    }
-                }
-            }
-
             _expandedKeys.Add(key);
             SetIsExpanded(item, true);
             await OnExpand.InvokeAsync(item);
@@ -527,13 +957,7 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
 
         await OnToggle.InvokeAsync(item);
 
-        await UpdateBoundKeys();
-
-        // A toggle can affect other items too (single-expand mode collapses the previously expanded
-        // item), and the click handler runs on the clicked item's renderer, so both the registered
-        // options and the accordion list itself need an explicit re-render.
-        RefreshOptions();
-        StateHasChanged();
+        return true;
     }
 
     private void RefreshOptions()
@@ -547,34 +971,81 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         }
     }
 
+    // The public methods are not called from an event handler, so nothing re-renders the component on their
+    // behalf the way Blazor does after a click, and the call can come from off the render loop altogether.
+    private Task RefreshAndRender()
+    {
+        if (IsDisposed) return Task.CompletedTask;
+
+        return InvokeAsync(() =>
+        {
+            RefreshOptions();
+            StateHasChanged();
+        });
+    }
+
+    private async Task FocusItemCore(TItem item)
+    {
+        if (_itemRefs.TryGetValue(item, out var itemRef) is false) return;
+
+        try
+        {
+            await itemRef.FocusAsync();
+        }
+        catch (JSDisconnectedException) { } // we can ignore this exception here
+    }
+
+    private TItem? FindItem(string? key)
+    {
+        return key.HasNoValue() ? null : _items.FirstOrDefault(i => GetItemKey(i) == key);
+    }
+
     private async Task UpdateBoundKeys()
+    {
+        _internalExpandedKeys = GetOrderedExpandedKeys();
+        _internalExpandedKey = _internalExpandedKeys.FirstOrDefault();
+
+        await PushBoundKeys();
+    }
+
+    private async Task PushBoundKeys()
     {
         if (Multiple)
         {
-            _internalExpandedKeys = GetOrderedExpandedKeys();
             await AssignExpandedKeys([.. _internalExpandedKeys]);
         }
         else
         {
-            _internalExpandedKey = _expandedKeys.FirstOrDefault();
             await AssignExpandedKey(_internalExpandedKey);
         }
     }
 
     private void BuildItemClassStyles()
     {
+        // The two objects are handed to every BitAccordion of the list as parameters, so a new pair of them on
+        // every render would re-render every item for nothing.
+        if (_itemClasses is not null && ReferenceEquals(_oldClasses, Classes) && ReferenceEquals(_oldStyles, Styles)) return;
+
+        _oldClasses = Classes;
+        _oldStyles = Styles;
+
         _itemClasses = new BitAccordionClassStyles
         {
             Root = Classes?.Item,
             Expanded = Classes?.ItemExpanded,
+            HeaderWrapper = Classes?.ItemHeaderWrapper,
+            Heading = Classes?.ItemHeading,
             Header = Classes?.ItemHeader,
+            Icon = Classes?.ItemIcon,
             HeaderContent = Classes?.ItemHeaderContent,
             Title = Classes?.ItemTitle,
             Description = Classes?.ItemDescription,
             ExpanderIconWrapper = Classes?.ItemExpanderIconWrapper,
             ExpanderIcon = Classes?.ItemExpanderIcon,
             ExpandedIcon = Classes?.ItemExpandedIcon,
+            Actions = Classes?.ItemActions,
             ContentContainer = Classes?.ItemContentContainer,
+            ContentWrapper = Classes?.ItemContentWrapper,
             Content = Classes?.ItemContent,
         };
 
@@ -582,14 +1053,19 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         {
             Root = Styles?.Item,
             Expanded = Styles?.ItemExpanded,
+            HeaderWrapper = Styles?.ItemHeaderWrapper,
+            Heading = Styles?.ItemHeading,
             Header = Styles?.ItemHeader,
+            Icon = Styles?.ItemIcon,
             HeaderContent = Styles?.ItemHeaderContent,
             Title = Styles?.ItemTitle,
             Description = Styles?.ItemDescription,
             ExpanderIconWrapper = Styles?.ItemExpanderIconWrapper,
             ExpanderIcon = Styles?.ItemExpanderIcon,
             ExpandedIcon = Styles?.ItemExpandedIcon,
+            Actions = Styles?.ItemActions,
             ContentContainer = Styles?.ItemContentContainer,
+            ContentWrapper = Styles?.ItemContentWrapper,
             Content = Styles?.ItemContent,
         };
     }
@@ -598,6 +1074,42 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
     {
         var key = GetItemKey(item);
         return key.HasValue() && _expandedKeys.Contains(key!);
+    }
+
+    // The header of the one panel that has to stay open reports itself as aria-disabled, the way the WAI-ARIA
+    // authoring practices ask a header whose panel cannot be collapsed to.
+    internal bool GetItemIsReadOnly(TItem item)
+    {
+        if (GetReadOnly(item) ?? ReadOnly) return true;
+
+        return Collapsible is false && _expandedKeys.Count <= 1 && IsItemExpanded(item);
+    }
+
+    internal bool GetItemHideExpanderIcon(TItem item)
+    {
+        return GetHideExpanderIcon(item) ?? HideExpanderIcon;
+    }
+
+    internal string? GetItemHeaderAriaLabel(TItem item)
+    {
+        if (item is BitAccordionListItem listItem)
+        {
+            return listItem.HeaderAriaLabel;
+        }
+
+        if (item is BitAccordionListOption listOption)
+        {
+            return listOption.HeaderAriaLabel;
+        }
+
+        if (NameSelectors is null) return null;
+
+        if (NameSelectors.HeaderAriaLabel.Selector is not null)
+        {
+            return NameSelectors.HeaderAriaLabel.Selector!(item);
+        }
+
+        return item.GetValueFromProperty<string?>(NameSelectors.HeaderAriaLabel.Name);
     }
 
     internal RenderFragment<bool>? GetItemHeaderTemplate(TItem item)
@@ -611,6 +1123,35 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         }
 
         return null;
+    }
+
+    internal RenderFragment? GetItemTitleTemplate(TItem item)
+    {
+        var itemTemplate = GetTitleTemplate(item);
+        if (itemTemplate is not null) return itemTemplate(item);
+
+        return TitleTemplate is not null ? TitleTemplate(item) : null;
+    }
+
+    internal RenderFragment<bool>? GetItemExpanderTemplate(TItem item)
+    {
+        var itemTemplate = GetExpanderTemplate(item);
+        if (itemTemplate is not null) return _ => itemTemplate(item);
+
+        if (ExpanderTemplate is not null)
+        {
+            return _ => ExpanderTemplate(item);
+        }
+
+        return null;
+    }
+
+    internal RenderFragment? GetItemActions(TItem item)
+    {
+        var itemActions = GetActions(item);
+        if (itemActions is not null) return itemActions(item);
+
+        return ActionsTemplate is not null ? ActionsTemplate(item) : null;
     }
 
     internal RenderFragment? GetItemBody(TItem item)
@@ -642,12 +1183,42 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         return GetExpanderIconName(item) ?? ExpanderIconName;
     }
 
+    internal BitIconInfo? GetItemExpandedExpanderIcon(TItem item)
+    {
+        return GetExpandedExpanderIcon(item) ?? ExpandedExpanderIcon;
+    }
+
+    internal string? GetItemExpandedExpanderIconName(TItem item)
+    {
+        return GetExpandedExpanderIconName(item) ?? ExpandedExpanderIconName;
+    }
+
+    internal BitIconInfo? GetItemIcon(TItem item)
+    {
+        return GetIcon(item);
+    }
+
+    internal string? GetItemIconName(TItem item)
+    {
+        return GetIconName(item);
+    }
+
 
 
     internal string? GetItemKey(TItem? item)
     {
         if (item is null) return null;
 
+        var key = GetDeclaredKey(item);
+        if (key.HasValue()) return key;
+
+        // An item that carries no key of its own - a custom type whose key property is computed, read-only or
+        // simply not there - is given a generated one that is kept beside it rather than written into it.
+        return _fallbackKeys.TryGetValue(item, out var fallback) ? fallback : null;
+    }
+
+    private string? GetDeclaredKey(TItem item)
+    {
         if (item is BitAccordionListItem listItem)
         {
             return listItem.Key;
@@ -682,9 +1253,7 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
             return;
         }
 
-        if (NameSelectors is null) return;
-
-        item.SetValueToProperty(NameSelectors.Key.Name, value);
+        _fallbackKeys[item] = value;
     }
 
     internal string? GetClass(TItem? item)
@@ -851,6 +1420,102 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         item.SetValueToProperty(NameSelectors.IsExpanded.Name, value);
     }
 
+    private bool? GetReadOnly(TItem? item)
+    {
+        if (item is null) return null;
+
+        if (item is BitAccordionListItem listItem)
+        {
+            return listItem.ReadOnly;
+        }
+
+        if (item is BitAccordionListOption listOption)
+        {
+            return listOption.ReadOnly;
+        }
+
+        if (NameSelectors is null) return null;
+
+        if (NameSelectors.ReadOnly.Selector is not null)
+        {
+            return NameSelectors.ReadOnly.Selector!(item);
+        }
+
+        return item.GetValueFromProperty<bool?>(NameSelectors.ReadOnly.Name);
+    }
+
+    private bool? GetHideExpanderIcon(TItem? item)
+    {
+        if (item is null) return null;
+
+        if (item is BitAccordionListItem listItem)
+        {
+            return listItem.HideExpanderIcon;
+        }
+
+        if (item is BitAccordionListOption listOption)
+        {
+            return listOption.HideExpanderIcon;
+        }
+
+        if (NameSelectors is null) return null;
+
+        if (NameSelectors.HideExpanderIcon.Selector is not null)
+        {
+            return NameSelectors.HideExpanderIcon.Selector!(item);
+        }
+
+        return item.GetValueFromProperty<bool?>(NameSelectors.HideExpanderIcon.Name);
+    }
+
+    private BitIconInfo? GetIcon(TItem? item)
+    {
+        if (item is null) return null;
+
+        if (item is BitAccordionListItem listItem)
+        {
+            return listItem.Icon;
+        }
+
+        if (item is BitAccordionListOption listOption)
+        {
+            return listOption.Icon;
+        }
+
+        if (NameSelectors is null) return null;
+
+        if (NameSelectors.Icon.Selector is not null)
+        {
+            return NameSelectors.Icon.Selector!(item);
+        }
+
+        return item.GetValueFromProperty<BitIconInfo?>(NameSelectors.Icon.Name);
+    }
+
+    private string? GetIconName(TItem? item)
+    {
+        if (item is null) return null;
+
+        if (item is BitAccordionListItem listItem)
+        {
+            return listItem.IconName;
+        }
+
+        if (item is BitAccordionListOption listOption)
+        {
+            return listOption.IconName;
+        }
+
+        if (NameSelectors is null) return null;
+
+        if (NameSelectors.IconName.Selector is not null)
+        {
+            return NameSelectors.IconName.Selector!(item);
+        }
+
+        return item.GetValueFromProperty<string?>(NameSelectors.IconName.Name);
+    }
+
     private BitIconInfo? GetExpanderIcon(TItem? item)
     {
         if (item is null) return null;
@@ -897,6 +1562,78 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         }
 
         return item.GetValueFromProperty<string?>(NameSelectors.ExpanderIconName.Name);
+    }
+
+    private BitIconInfo? GetExpandedExpanderIcon(TItem? item)
+    {
+        if (item is null) return null;
+
+        if (item is BitAccordionListItem listItem)
+        {
+            return listItem.ExpandedExpanderIcon;
+        }
+
+        if (item is BitAccordionListOption listOption)
+        {
+            return listOption.ExpandedExpanderIcon;
+        }
+
+        if (NameSelectors is null) return null;
+
+        if (NameSelectors.ExpandedExpanderIcon.Selector is not null)
+        {
+            return NameSelectors.ExpandedExpanderIcon.Selector!(item);
+        }
+
+        return item.GetValueFromProperty<BitIconInfo?>(NameSelectors.ExpandedExpanderIcon.Name);
+    }
+
+    private string? GetExpandedExpanderIconName(TItem? item)
+    {
+        if (item is null) return null;
+
+        if (item is BitAccordionListItem listItem)
+        {
+            return listItem.ExpandedExpanderIconName;
+        }
+
+        if (item is BitAccordionListOption listOption)
+        {
+            return listOption.ExpandedExpanderIconName;
+        }
+
+        if (NameSelectors is null) return null;
+
+        if (NameSelectors.ExpandedExpanderIconName.Selector is not null)
+        {
+            return NameSelectors.ExpandedExpanderIconName.Selector!(item);
+        }
+
+        return item.GetValueFromProperty<string?>(NameSelectors.ExpandedExpanderIconName.Name);
+    }
+
+    private RenderFragment<TItem>? GetActions(TItem? item)
+    {
+        if (item is null) return null;
+
+        if (item is BitAccordionListItem listItem)
+        {
+            return listItem.Actions as RenderFragment<TItem>;
+        }
+
+        if (item is BitAccordionListOption listOption)
+        {
+            return listOption.Actions as RenderFragment<TItem>;
+        }
+
+        if (NameSelectors is null) return null;
+
+        if (NameSelectors.Actions.Selector is not null)
+        {
+            return NameSelectors.Actions.Selector!(item);
+        }
+
+        return item.GetValueFromProperty<RenderFragment<TItem>?>(NameSelectors.Actions.Name);
     }
 
     private RenderFragment<TItem>? GetBody(TItem? item)
@@ -947,7 +1684,55 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         return item.GetValueFromProperty<RenderFragment<TItem>?>(NameSelectors.HeaderTemplate.Name);
     }
 
-    private void InvokeItemClick(TItem item)
+    private RenderFragment<TItem>? GetTitleTemplate(TItem? item)
+    {
+        if (item is null) return null;
+
+        if (item is BitAccordionListItem listItem)
+        {
+            return listItem.TitleTemplate as RenderFragment<TItem>;
+        }
+
+        if (item is BitAccordionListOption listOption)
+        {
+            return listOption.TitleTemplate as RenderFragment<TItem>;
+        }
+
+        if (NameSelectors is null) return null;
+
+        if (NameSelectors.TitleTemplate.Selector is not null)
+        {
+            return NameSelectors.TitleTemplate.Selector!(item);
+        }
+
+        return item.GetValueFromProperty<RenderFragment<TItem>?>(NameSelectors.TitleTemplate.Name);
+    }
+
+    private RenderFragment<TItem>? GetExpanderTemplate(TItem? item)
+    {
+        if (item is null) return null;
+
+        if (item is BitAccordionListItem listItem)
+        {
+            return listItem.ExpanderTemplate as RenderFragment<TItem>;
+        }
+
+        if (item is BitAccordionListOption listOption)
+        {
+            return listOption.ExpanderTemplate as RenderFragment<TItem>;
+        }
+
+        if (NameSelectors is null) return null;
+
+        if (NameSelectors.ExpanderTemplate.Selector is not null)
+        {
+            return NameSelectors.ExpanderTemplate.Selector!(item);
+        }
+
+        return item.GetValueFromProperty<RenderFragment<TItem>?>(NameSelectors.ExpanderTemplate.Name);
+    }
+
+    private async Task InvokeItemClick(TItem item)
     {
         if (item is BitAccordionListItem listItem)
         {
@@ -957,7 +1742,7 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
 
         if (item is BitAccordionListOption listOption)
         {
-            _ = listOption.OnClick.InvokeAsync(listOption);
+            await listOption.OnClick.InvokeAsync(listOption);
             return;
         }
 
@@ -971,5 +1756,18 @@ public partial class BitAccordionList<TItem> : BitComponentBase where TItem : cl
         {
             item.GetValueFromProperty<Action<TItem>?>(NameSelectors.OnClick.Name)?.Invoke(item);
         }
+    }
+
+
+
+    // The items are held by identity: two items of a type that compares by value are still two panels of the
+    // list, each with its own key and its own expanded state.
+    private sealed class ReferenceComparer : IEqualityComparer<TItem>
+    {
+        internal static readonly ReferenceComparer Instance = new();
+
+        public bool Equals(TItem? x, TItem? y) => ReferenceEquals(x, y);
+
+        public int GetHashCode(TItem obj) => RuntimeHelpers.GetHashCode(obj);
     }
 }

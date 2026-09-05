@@ -6,7 +6,8 @@
      id="@_Id"
      style="@StyleBuilder.Value"
      class="@ClassBuilder.Value"
-     dir="@Dir?.ToString().ToLower()">
+     dir="@Dir?.ToString().ToLower()"
+     aria-label="@AriaLabel">
     @if (ChildContent is not null || Options is not null)
     {
         <CascadingValue Value="this" IsFixed="true">
